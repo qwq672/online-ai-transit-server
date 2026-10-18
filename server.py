@@ -40,6 +40,16 @@ UPSTREAMS = {
     "tavily": "https://api.tavily.com",
 }
 
+# 中转服务器为每个 provider 配置的默认模型。
+# 当客户端开启"使用中转服务器的模型"开关后，请求体里不带 model 字段，
+# 中转服务器从这里挑一个填上。
+# 可通过环境变量 TRANSIT_DEFAULT_MODEL_<PROVIDER> 覆盖。
+DEFAULT_MODELS = {
+    "zhipu":  os.environ.get("TRANSIT_DEFAULT_MODEL_ZHIPU",  "glm-4-flash"),
+    "openai": os.environ.get("TRANSIT_DEFAULT_MODEL_OPENAI", "gpt-4o-mini"),
+    "ollama": os.environ.get("TRANSIT_DEFAULT_MODEL_OLLAMA", "llama3.2"),
+}
+
 # 默认上游（如果 X-Provider 没传）
 DEFAULT_PROVIDER = "openai"
 
@@ -100,6 +110,13 @@ def chat_completions():
         body_json = json.loads(body)
     except json.JSONDecodeError:
         return jsonify({"error": "invalid JSON body"}), 400
+
+    # 如果客户端没传 model 字段（"使用中转服务器的模型"开关开启），
+    # 用中转服务器的默认模型填上。
+    if not body_json.get("model") and provider in DEFAULT_MODELS:
+        body_json["model"] = DEFAULT_MODELS[provider]
+        body = json.dumps(body_json).encode("utf-8")
+        app.logger.info(f"substituted default model {body_json['model']} for provider {provider}")
 
     # 强制 stream=true 透传（如果客户端请求流式）
     is_stream = body_json.get("stream", False)
