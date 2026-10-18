@@ -1,0 +1,14 @@
+# Caddyfile 示例 — 反代 transit server 到 HTTPS（用现代证书）
+# 让 iOS 6 通过 https://ai-transit.example.com/ 访问，规避 TLS 兼容问题
+
+ai-transit.example.com {
+    reverse_proxy localhost:8443 {
+        # 流式响应不要缓冲
+        flush_interval -1
+    }
+    
+    # 流式响应禁用 gzip（gzip 会缓冲 chunk，破坏 SSE）
+    encode {
+        exclude /v1/chat/completions
+    }
+}
