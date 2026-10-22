@@ -229,6 +229,68 @@ def list_models():
     )
 
 
+@app.route("/v1/images/generations", methods=["POST"])
+def images_generations():
+    """透传到上游图片生成 API.
+
+    客户端在请求体里放:
+      {"model": "dall-e-3" | "cogview-3plus" | ...,
+       "prompt": "...", "n": 1, "size": "1024x1024",
+       "response_format": "b64_json" | "url"}
+
+    路由:
+      X-Provider: openai → https://api.openai.com/v1/images/generations
+      X-Provider: zhipu  → https://open.bigmodel.cn/api/paas/v4/images/generations
+    """
+    provider, upstream_base = _resolve_upstream()
+    upstream_url = upstream_base.rstrip("/") + "/images/generations"
+    body = request.get_data(as_text=False)
+    headers = _forward_headers(upstream_url)
+
+    try:
+        upstream_resp = requests.post(
+            upstream_url,
+            data=body,
+            headers=headers,
+            timeout=(UPSTREAM_CONNECT_TIMEOUT, 120),  # image gen can be slow
+        )
+    except requests.RequestException as e:
+        return jsonify({"error": "upstream error", "detail": str(e)}), 502
+
+    return Response(
+        upstream_resp.content,
+        status=upstream_resp.status_code,
+        content_type=upstream_resp.headers.get("Content-Type", "application/json"),
+    )
+
+
+@app.route("/v1/fetch_image", methods=["GET"])
+def fetch_image():
+    """通过中转服务器拉取任意图片 URL，返回原始字节.
+
+    用来规避 iOS 6 NSURLConnection 无法与某些图片托管服务（如 Azure
+    Blob Storage、AWS S3）协商 TLS 的问题。
+
+    用法: GET /v1/fetch_image?url=https://example.com/image.png
+    返回: 原始图片字节，Content-Type 由上游决定。
+    """
+    image_url = request.args.get("url")
+    if not image_url:
+        return jsonify({"error": "missing 'url' query parameter"}), 400
+    try:
+        upstream_resp = requests.get(
+            image_url,
+            timeout=(UPSTREAM_CONNECT_TIMEOUT, 60),
+        )
+    except requests.RequestException as e:
+        return jsonify({"error": "fetch failed", "detail": str(e)}), 502
+    return Response(
+        upstream_resp.content,
+        status=upstream_resp.status_code,
+        content_type=upstream_resp.headers.get("Content-Type", "application/octet-stream"),
+    )
+
+
 @app.route("/", methods=["GET"])
 def index():
     return jsonify({
@@ -236,6 +298,8 @@ def index():
         "endpoints": [
             "POST /v1/chat/completions",
             "POST /v1/tavily/search",
+            "POST /v1/images/generations",
+            "GET  /v1/fetch_image",
             "GET  /v1/models",
             "GET  /health",
         ],

@@ -91,6 +91,14 @@ export default {
       return tavilySearch(request, env);
     }
 
+    if (path === '/v1/images/generations' && request.method === 'POST') {
+      return imagesGenerations(request, env);
+    }
+
+    if (path === '/v1/fetch_image' && request.method === 'GET') {
+      return fetchImage(request, env);
+    }
+
     if (path === '/v1/models' && request.method === 'GET') {
       return listModels(request, env);
     }
@@ -275,5 +283,66 @@ async function listModels(request, env) {
     });
   } catch (e) {
     return jsonResponse({ error: 'upstream error', detail: String(e) }, 502);
+  }
+}
+
+// POST /v1/images/generations — 透传到上游图片生成 API
+// X-Provider 决定上游：
+//   openai → https://api.openai.com/v1/images/generations
+//   zhipu  → https://open.bigmodel.cn/api/paas/v4/images/generations
+async function imagesGenerations(request, env) {
+  const provider = resolveProvider(request);
+  const upstreamBase = UPSTREAMS[provider];
+  const upstreamUrl = upstreamBase.replace(/\/$/, '') + '/images/generations';
+  const rawBody = await request.text();
+  const headers = forwardHeaders(request, upstreamUrl);
+
+  const upstreamReq = new Request(upstreamUrl, {
+    method: 'POST',
+    headers,
+    body: rawBody,
+  });
+
+  try {
+    const upstreamResp = await fetch(upstreamReq);
+    const text = await upstreamResp.text();
+    return new Response(text, {
+      status: upstreamResp.status,
+      headers: {
+        'Content-Type': upstreamResp.headers.get('Content-Type') || 'application/json',
+        ...corsHeaders(),
+      },
+    });
+  } catch (e) {
+    return jsonResponse({ error: 'upstream error', detail: String(e) }, 502);
+  }
+}
+
+// GET /v1/fetch_image?url=... — 拉取任意图片 URL，返回原始字节
+// 用于规避 iOS 6 与某些图片托管服务的 TLS 兼容问题
+async function fetchImage(request, env) {
+  const url = new URL(request.url);
+  const imageUrl = url.searchParams.get('url');
+  if (!imageUrl) {
+    return jsonResponse({ error: "missing 'url' query parameter" }, 400);
+  }
+
+  const upstreamReq = new Request(imageUrl, {
+    method: 'GET',
+    headers: { 'Accept': 'image/*, application/octet-stream' },
+  });
+
+  try {
+    const upstreamResp = await fetch(upstreamReq);
+    const buf = await upstreamResp.arrayBuffer();
+    return new Response(buf, {
+      status: upstreamResp.status,
+      headers: {
+        'Content-Type': upstreamResp.headers.get('Content-Type') || 'application/octet-stream',
+        ...corsHeaders(),
+      },
+    });
+  } catch (e) {
+    return jsonResponse({ error: 'fetch failed', detail: String(e) }, 502);
   }
 }
