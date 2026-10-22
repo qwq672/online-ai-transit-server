@@ -24,10 +24,14 @@
  *   tavily  → https://api.tavily.com
  */
 
+// 上游 URL 表 — base URL 已包含版本路径（/v1 或 /api/paas/v4）
+// 这样 + "/chat/completions" 拼出来的端点才正确。
+// BUG FIX v261018-14: 之前 openai=api.openai.com（缺 /v1），
+// 导致 https://api.openai.com/chat/completions → 404 → iOS 收到空回复。
 const UPSTREAMS = {
-  zhipu: 'https://open.bigmodel.cn/api/paas/v4',
-  openai: 'https://api.openai.com',
-  ollama: 'http://localhost:11434', // Worker 内无法访问 — 仅占位
+  zhipu: 'https://open.bigmodel.cn/api/paas/v4',  // 已含版本路径
+  openai: 'https://api.openai.com/v1',            // 加上 /v1（修复！）
+  ollama: 'http://localhost:11434/v1',            // 加上 /v1
   tavily: 'https://api.tavily.com',
 };
 
@@ -131,12 +135,9 @@ function forwardHeaders(request, upstreamUrl) {
 async function chatCompletions(request, env) {
   const provider = resolveProvider(request);
   const upstreamBase = UPSTREAMS[provider];
-  let upstreamUrl = upstreamBase.replace(/\/$/, '') + '/chat/completions';
-  // 智谱 base URL 已经包含 /api/paas/v4
-  // OpenAI base URL 是 https://api.openai.com，需要加 /v1/chat/completions
-  if (!upstreamUrl.includes('/chat/completions')) {
-    upstreamUrl = upstreamBase.replace(/\/$/, '') + '/v1/chat/completions';
-  }
+  // UPSTREAMS already includes /v1 (for openai/ollama) or /api/paas/v4 (zhipu).
+  // Just append /chat/completions.
+  const upstreamUrl = upstreamBase.replace(/\/$/, '') + '/chat/completions';
 
   const rawBody = await request.text();
   let bodyJson;

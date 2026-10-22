@@ -32,11 +32,14 @@ import requests
 
 app = Flask(__name__)
 
-# 上游 URL 表
+# 上游 URL 表 — base URL 已包含版本路径（/v1 或 /api/paas/v4）
+# 这样 + "/chat/completions" 拼出来的端点才正确。
+# BUG FIX v261018-14: 之前 openai=api.openai.com（缺 /v1），
+# 导致 https://api.openai.com/chat/completions → 404 → iOS 收到空回复。
 UPSTREAMS = {
-    "zhipu":  "https://open.bigmodel.cn/api/paas/v4",
-    "openai": "https://api.openai.com",
-    "ollama": "http://localhost:11434",
+    "zhipu":  "https://open.bigmodel.cn/api/paas/v4",  # 已含版本路径
+    "openai": "https://api.openai.com/v1",             # 加上 /v1（修复！）
+    "ollama": "http://localhost:11434/v1",             # 加上 /v1
     "tavily": "https://api.tavily.com",
 }
 
@@ -100,10 +103,9 @@ def chat_completions():
     stream_with_context 生成器把 chunk 原样转发给客户端。
     """
     provider, upstream_base = _resolve_upstream()
+    # UPSTREAMS 已包含版本路径 (/v1 或 /api/paas/v4)，
+    # 直接拼 /chat/completions 即可。
     upstream_url = upstream_base.rstrip("/") + "/chat/completions"
-    if "open.bigmodel.cn" in upstream_url:
-        # 智谱：base URL 已经包含 /api/paas/v4，所以直接拼 chat/completions
-        upstream_url = upstream_base.rstrip("/") + "/chat/completions"
 
     body = request.get_data(as_text=False)
     try:
