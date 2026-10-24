@@ -37,21 +37,22 @@ const UPSTREAMS = {
 
 const DEFAULT_PROVIDER = 'openai';
 
-// 中转服务器为每个 provider 配置的默认模型。
-// 客户端开启「使用中转服务器的模型」后，请求体里不带 model 字段，
-// 中转服务器从这里挑一个填上。
-// 可通过环境变量（Worker 的 Variables）覆盖：DEFAULT_MODEL_ZHIPU 等。
-const DEFAULT_MODELS = {
-  zhipu: DEFAULT_MODEL_ZHIPU || 'glm-4-flash',
-  openai: DEFAULT_MODEL_OPENAI || 'gpt-4o-mini',
-  ollama: DEFAULT_MODEL_OLLAMA || 'llama3.2',
-};
-
-const UPSTREAM_TIMEOUT_MS = 30000; // Worker 限制单请求 30s
-const STREAM_CHUNK_SIZE = 4096;
+// v261025-1 CRITICAL FIX: this object used to reference bare
+// `DEFAULT_MODEL_ZHIPU || 'glm-4-flash'` etc. — UNDEFINED variables.
+// In the Workers ES-module format, dashboard Variables arrive via the
+// `env` parameter, NOT as globals, so evaluating those names throws
+// `ReferenceError` at module-load time — which would brick the ENTIRE
+// worker (every route would 500) the moment anyone redeployed this
+// file. The live deployment predates that commit, which is the only
+// reason it still works. Resolve from `env` at request time instead.
+function defaultModelFor(provider, env) {
+  if (!env) return null;
+  const key = 'DEFAULT_MODEL_' + provider.toUpperCase();
+  return env[key] || null;
+}
 
 // 部署版本号 — curl https://<worker域名>/version 验证。
-const SERVER_VERSION = 'v261024-1';
+const SERVER_VERSION = 'v261025-1';
 
 export default {
   async fetch(request, env, ctx) {
@@ -176,18 +177,25 @@ async function chatCompletions(request, env) {
   try {
     bodyJson = JSON.parse(rawBody);
   } catch (e) {
+    console.log(`[chat] 400 invalid JSON from client (${rawBody.length}B)`);
     return jsonResponse({ error: 'invalid JSON body' }, 400);
   }
 
   // 「使用中转服务器的模型」开关：客户端不带 model 字段时填默认
-  if (!bodyJson.model && DEFAULT_MODELS[provider]) {
-    bodyJson.model = DEFAULT_MODELS[provider];
-    console.log(`substituted default model ${bodyJson.model} for provider ${provider}`);
+  const t0 = Date.now();
+  if (!bodyJson.model) {
+    const dm = defaultModelFor(provider, env);
+    if (dm) {
+      bodyJson.model = dm;
+      console.log(`[chat] substituted default model ${dm} for provider ${provider}`);
+    }
   }
 
   const isStream = bodyJson.stream === true;
   const headers = forwardHeaders(request, upstreamUrl);
   if (isStream) headers['Accept'] = 'text/event-stream';
+
+  console.log(`[chat] → ${provider} ${bodyJson.model || '(no model)'} stream=${isStream} msgs=${(bodyJson.messages || []).length}B=${rawBody.length}`);
 
   const upstreamReq = new Request(upstreamUrl, {
     method: 'POST',
@@ -201,12 +209,16 @@ async function chatCompletions(request, env) {
       // Cloudflare Worker 的 fetch 自动支持流式响应
     });
   } catch (e) {
+    console.log(`[chat] ✗ upstream fetch failed after ${Date.now() - t0}ms: ${e}`);
     return jsonResponse({ error: 'upstream error', detail: String(e) }, 502);
   }
+
+  console.log(`[chat] ← HTTP ${upstreamResp.status} after ${Date.now() - t0}ms`);
 
   if (!isStream) {
     // 非流式：直接返回 JSON
     const text = await upstreamResp.text();
+    console.log(`[chat] done ${Date.now() - t0}ms total, ${text.length}B body`);
     return new Response(text, {
       status: upstreamResp.status,
       headers: {
@@ -232,6 +244,7 @@ async function chatCompletions(request, env) {
       }
     } catch (e) {
       // 上游中断 — 发送错误 SSE 事件
+      console.log(`[chat] ✗ stream broke after ${Date.now() - t0}ms: ${e}`);
       const errPayload = JSON.stringify({
         error: { message: `transit stream error: ${e}` },
       });
@@ -239,6 +252,7 @@ async function chatCompletions(request, env) {
       await writer.write(encoder.encode(`data: ${errPayload}\n\ndata: [DONE]\n\n`));
     } finally {
       await writer.close();
+      console.log(`[chat] stream closed after ${Date.now() - t0}ms total`);
     }
   })();
 
@@ -256,12 +270,15 @@ async function chatCompletions(request, env) {
 async function tavilySearch(request, env) {
   const upstreamUrl = 'https://api.tavily.com/search';
   const rawBody = await request.text();
+  const t0 = Date.now();
   const headers = {
     'Content-Type': 'application/json',
     'Accept': 'application/json',
   };
   const auth = request.headers.get('Authorization');
   if (auth) headers['Authorization'] = auth;
+
+  console.log(`[tavily] → ${rawBody.length}B`);
 
   const upstreamReq = new Request(upstreamUrl, {
     method: 'POST',
@@ -272,6 +289,7 @@ async function tavilySearch(request, env) {
   try {
     const upstreamResp = await fetch(upstreamReq);
     const text = await upstreamResp.text();
+    console.log(`[tavily] ← HTTP ${upstreamResp.status} after ${Date.now() - t0}ms, ${text.length}B`);
     return new Response(text, {
       status: upstreamResp.status,
       headers: {
@@ -280,6 +298,7 @@ async function tavilySearch(request, env) {
       },
     });
   } catch (e) {
+    console.log(`[tavily] ✗ ${e}`);
     return jsonResponse({ error: 'upstream error', detail: String(e) }, 502);
   }
 }
@@ -289,6 +308,9 @@ async function listModels(request, env) {
   const upstreamBase = UPSTREAMS[provider];
   const upstreamUrl = upstreamBase.replace(/\/$/, '') + '/models';
   const headers = forwardHeaders(request, upstreamUrl);
+  const t0 = Date.now();
+
+  console.log(`[models] → ${provider}`);
 
   const upstreamReq = new Request(upstreamUrl, {
     method: 'GET',
@@ -298,6 +320,7 @@ async function listModels(request, env) {
   try {
     const upstreamResp = await fetch(upstreamReq);
     const text = await upstreamResp.text();
+    console.log(`[models] ← HTTP ${upstreamResp.status} after ${Date.now() - t0}ms, ${text.length}B`);
     return new Response(text, {
       status: upstreamResp.status,
       headers: {
@@ -306,6 +329,7 @@ async function listModels(request, env) {
       },
     });
   } catch (e) {
+    console.log(`[models] ✗ ${e}`);
     return jsonResponse({ error: 'upstream error', detail: String(e) }, 502);
   }
 }
@@ -320,6 +344,9 @@ async function imagesGenerations(request, env) {
   const upstreamUrl = upstreamBase.replace(/\/$/, '') + '/images/generations';
   const rawBody = await request.text();
   const headers = forwardHeaders(request, upstreamUrl);
+  const t0 = Date.now();
+
+  console.log(`[images] → ${provider} ${rawBody.length}B`);
 
   const upstreamReq = new Request(upstreamUrl, {
     method: 'POST',
@@ -330,6 +357,7 @@ async function imagesGenerations(request, env) {
   try {
     const upstreamResp = await fetch(upstreamReq);
     const text = await upstreamResp.text();
+    console.log(`[images] ← HTTP ${upstreamResp.status} after ${Date.now() - t0}ms, ${text.length}B`);
     return new Response(text, {
       status: upstreamResp.status,
       headers: {
@@ -338,6 +366,7 @@ async function imagesGenerations(request, env) {
       },
     });
   } catch (e) {
+    console.log(`[images] ✗ ${e}`);
     return jsonResponse({ error: 'upstream error', detail: String(e) }, 502);
   }
 }
@@ -359,6 +388,7 @@ async function fetchImage(request, env) {
   try {
     const upstreamResp = await fetch(upstreamReq);
     const buf = await upstreamResp.arrayBuffer();
+    console.log(`[fetch_image] ← HTTP ${upstreamResp.status} ${buf.byteLength}B`);
     return new Response(buf, {
       status: upstreamResp.status,
       headers: {
@@ -367,6 +397,7 @@ async function fetchImage(request, env) {
       },
     });
   } catch (e) {
+    console.log(`[fetch_image] ✗ ${e}`);
     return jsonResponse({ error: 'fetch failed', detail: String(e) }, 502);
   }
 }

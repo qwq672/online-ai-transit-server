@@ -35,7 +35,7 @@ app = Flask(__name__)
 
 # 部署版本号 — 用于确认线上跑的是哪一版：
 #   curl https://<你的中转域名>/version
-SERVER_VERSION = "v261024-1"
+SERVER_VERSION = "v261025-1"
 
 # 上游 URL 表 — base URL 已包含版本路径（/v1 或 /api/paas/v4）
 # 这样 + "/chat/completions" 拼出来的端点才正确。
