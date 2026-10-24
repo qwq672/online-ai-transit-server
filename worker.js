@@ -50,6 +50,9 @@ const DEFAULT_MODELS = {
 const UPSTREAM_TIMEOUT_MS = 30000; // Worker 限制单请求 30s
 const STREAM_CHUNK_SIZE = 4096;
 
+// 部署版本号 — curl https://<worker域名>/version 验证。
+const SERVER_VERSION = 'v261024-1';
+
 export default {
   async fetch(request, env, ctx) {
     const url = new URL(request.url);
@@ -67,18 +70,39 @@ export default {
       return jsonResponse({
         status: 'ok',
         service: 'online-ai-transit-server-cfworker',
+        version: SERVER_VERSION,
         providers: Object.keys(UPSTREAMS),
+      });
+    }
+
+    // 部署验证端点 — 升级后 curl 这个路径确认版本号。
+    if (path === '/version' && request.method === 'GET') {
+      return jsonResponse({
+        version: SERVER_VERSION,
+        endpoints: [
+          'POST /v1/chat/completions',
+          'POST /v1/tavily/search',
+          'POST /v1/images/generations',
+          'GET  /v1/fetch_image',
+          'GET  /v1/models',
+          'GET  /health',
+          'GET  /version',
+        ],
       });
     }
 
     if (path === '/' && request.method === 'GET') {
       return jsonResponse({
         service: 'online-ai-transit-server-cfworker',
+        version: SERVER_VERSION,
         endpoints: [
           'POST /v1/chat/completions',
           'POST /v1/tavily/search',
+          'POST /v1/images/generations',
+          'GET  /v1/fetch_image',
           'GET  /v1/models',
           'GET  /health',
+          'GET  /version',
         ],
       });
     }

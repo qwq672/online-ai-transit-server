@@ -27,10 +27,15 @@ X-Provider 请求头决定上游：
 
 import os
 import json
+import time
 from flask import Flask, request, Response, stream_with_context, jsonify
 import requests
 
 app = Flask(__name__)
+
+# 部署版本号 — 用于确认线上跑的是哪一版：
+#   curl https://<你的中转域名>/version
+SERVER_VERSION = "v261024-1"
 
 # 上游 URL 表 — base URL 已包含版本路径（/v1 或 /api/paas/v4）
 # 这样 + "/chat/completions" 拼出来的端点才正确。
@@ -57,7 +62,9 @@ DEFAULT_MODELS = {
 DEFAULT_PROVIDER = "openai"
 
 # 上游连接超时（秒）
-UPSTREAM_TIMEOUT = 120  # 长一些，让 AI 慢慢生成
+# 读取超时 300s：thinking 类模型在输出前可能有长时间静默，
+# 120s 会在流中间断开（表现为回复突然截断/空）。
+UPSTREAM_TIMEOUT = 300
 UPSTREAM_CONNECT_TIMEOUT = 15
 
 # 流式 chunk 大小（字节）
@@ -70,6 +77,31 @@ def _resolve_upstream():
     if not provider:
         provider = DEFAULT_PROVIDER
     return provider, UPSTREAMS.get(provider, UPSTREAMS[DEFAULT_PROVIDER])
+
+
+# --- 请求日志 -----------------------------------------------------------
+# 排障关键：每个请求记录 method / path / provider / 上游状态码 / 耗时。
+# Docker 部署看 `docker logs`，systemd 看 journalctl。
+@app.after_request
+def _log_request(resp):
+    try:
+        dur = getattr(request, "_start_ts", None)
+        dur_ms = int((time.time() - dur) * 1000) if dur else -1
+        app.logger.info(
+            "%s %s provider=%s -> %d (%dms)",
+            request.method, request.path,
+            request.headers.get("X-Provider", "-") or "-",
+            resp.status_code, dur_ms,
+        )
+    except Exception:
+        pass
+    return resp
+
+
+@app.before_request
+def _mark_start():
+    request._start_ts = time.time()
+    return None
 
 
 def _forward_headers(upstream_url):
@@ -91,7 +123,25 @@ def _forward_headers(upstream_url):
 
 @app.route("/health")
 def health():
-    return jsonify({"status": "ok", "service": "online-ai-transit-server"})
+    return jsonify({"status": "ok", "service": "online-ai-transit-server",
+                    "version": SERVER_VERSION})
+
+
+@app.route("/version")
+def version():
+    """部署验证端点 — 升级后 curl 这个路径确认版本号。"""
+    return jsonify({
+        "version": SERVER_VERSION,
+        "endpoints": [
+            "POST /v1/chat/completions",
+            "POST /v1/tavily/search",
+            "POST /v1/images/generations",
+            "GET  /v1/fetch_image",
+            "GET  /v1/models",
+            "GET  /health",
+            "GET  /version",
+        ],
+    })
 
 
 @app.route("/v1/chat/completions", methods=["POST"])
@@ -111,7 +161,14 @@ def chat_completions():
     try:
         body_json = json.loads(body)
     except json.JSONDecodeError:
+        app.logger.warning("invalid JSON body from %s", request.remote_addr)
         return jsonify({"error": "invalid JSON body"}), 400
+
+    app.logger.info("chat provider=%s model=%s stream=%s msgs=%d",
+                    provider,
+                    body_json.get("model", "<server-default>"),
+                    body_json.get("stream", False),
+                    len(body_json.get("messages", [])))
 
     # 如果客户端没传 model 字段（"使用中转服务器的模型"开关开启），
     # 用中转服务器的默认模型填上。
