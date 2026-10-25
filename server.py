@@ -5,24 +5,42 @@ online-ai-transit-server
 
 iOS 6 NSURLConnection 在现代 TLS（Let's Encrypt ECDSA 证书、TLS 1.3）
 下经常握手失败。中转服务器接收 iOS 6 设备的 HTTPS 请求，自己用
-现代 Python `requests` 库（支持 TLS 1.2/1.3）转发到上游 AI/Tavily。
+现代 Python `requests` 库（支持 TLS 1.2/1.3）转发到客户端指定的
+目标 URL。
 
-支持路由：
-  POST /v1/chat/completions  — SSE 流式透传
-  POST /v1/tavily/search     — 普通透传
-  GET  /v1/models            — 普通透传
-  GET  /health               — 健康检查
+v261025-3 设计大改：中转服务器不再维护 UPSTREAMS 上游路由表，
+也不再根据 X-Provider 头路由到 zhipu/openai/ollama/tavily。
+现在中转是一个**纯 TLS 透传代理**：
 
-X-Provider 请求头决定上游：
-  zhipu   → https://open.bigmodel.cn/api/paas/v4
-  openai  → https://api.openai.com
-  ollama  → http://localhost:11434
-  tavily  → https://api.tavily.com
+  - 关闭中转默认模型（默认）：
+    客户端在 HTTP header `X-Target-URL` 里指定真正的目标地址，
+    中转原样转发 body（含 model、messages、Authorization、stream=true）
+    到 X-Target-URL，SSE 流式原样回流。
 
-部署：
-  pip install -r requirements.txt
-  python server.py
-建议用 Caddy 反代到 HTTPS。
+    例如：客户端 X-Target-URL: https://discovery-api.intern-ai.org.cn/v1/chat/completions
+    中转替 iOS 6 完成 TLS，把请求原样转发到 intern-ai 的 chat/completions，
+    流式响应原样回给客户端。
+
+  - 开启中转默认模型：
+    客户端可以拉中转服务器自带的模型列表 (GET /v1/transit/models)。
+    服务端通过环境变量 TRANSIT_MODELS_ENABLED=1/0 控制是否启用，
+    TRANSIT_MODELS=glm-4-flash,gpt-4o-mini 配置可选模型。
+
+路由：
+  POST /v1/chat/completions    — 透传到 X-Target-URL（含 SSE 流式）
+  POST /v1/tavily/search       — 透传到 X-Target-URL（默认 api.tavily.com/search）
+  POST /v1/images/generations  — 透传到 X-Target-URL
+  GET  /v1/fetch_image?url=     — 拉取任意图片 URL
+  GET  /v1/models               — 兼容端点，等同 /v1/transit/models
+  GET  /v1/transit/models       — 返回中转自带模型列表
+  GET  /health                  — 健康检查
+  GET  /version                 — 部署验证
+
+环境变量：
+  PORT                          — 监听端口（默认 8443）
+  TRANSIT_MODELS_ENABLED        — 是否启用自带模型（"1"/"0"，默认 "0"）
+  TRANSIT_MODELS                — 自带模型列表，逗号分隔
+                                   （例如 "glm-4-flash,gpt-4o-mini"）
 """
 
 import os
@@ -35,31 +53,7 @@ app = Flask(__name__)
 
 # 部署版本号 — 用于确认线上跑的是哪一版：
 #   curl https://<你的中转域名>/version
-SERVER_VERSION = "v261025-1"
-
-# 上游 URL 表 — base URL 已包含版本路径（/v1 或 /api/paas/v4）
-# 这样 + "/chat/completions" 拼出来的端点才正确。
-# BUG FIX v261018-14: 之前 openai=api.openai.com（缺 /v1），
-# 导致 https://api.openai.com/chat/completions → 404 → iOS 收到空回复。
-UPSTREAMS = {
-    "zhipu":  "https://open.bigmodel.cn/api/paas/v4",  # 已含版本路径
-    "openai": "https://api.openai.com/v1",             # 加上 /v1（修复！）
-    "ollama": "http://localhost:11434/v1",             # 加上 /v1
-    "tavily": "https://api.tavily.com",
-}
-
-# 中转服务器为每个 provider 配置的默认模型。
-# 当客户端开启"使用中转服务器的模型"开关后，请求体里不带 model 字段，
-# 中转服务器从这里挑一个填上。
-# 可通过环境变量 TRANSIT_DEFAULT_MODEL_<PROVIDER> 覆盖。
-DEFAULT_MODELS = {
-    "zhipu":  os.environ.get("TRANSIT_DEFAULT_MODEL_ZHIPU",  "glm-4-flash"),
-    "openai": os.environ.get("TRANSIT_DEFAULT_MODEL_OPENAI", "gpt-4o-mini"),
-    "ollama": os.environ.get("TRANSIT_DEFAULT_MODEL_OLLAMA", "llama3.2"),
-}
-
-# 默认上游（如果 X-Provider 没传）
-DEFAULT_PROVIDER = "openai"
+SERVER_VERSION = "v261025-3"
 
 # 上游连接超时（秒）
 # 读取超时 300s：thinking 类模型在输出前可能有长时间静默，
@@ -71,26 +65,43 @@ UPSTREAM_CONNECT_TIMEOUT = 15
 STREAM_CHUNK_SIZE = 4096
 
 
-def _resolve_upstream():
-    """根据 X-Provider 头决定上游 base URL。"""
-    provider = request.headers.get("X-Provider", "").strip().lower()
-    if not provider:
-        provider = DEFAULT_PROVIDER
-    return provider, UPSTREAMS.get(provider, UPSTREAMS[DEFAULT_PROVIDER])
+def _transit_models():
+    """读取服务端配置的自带模型列表。
+
+    Returns (enabled: bool, models: list[str])
+    """
+    enabled = os.environ.get("TRANSIT_MODELS_ENABLED", "0").strip() in ("1", "true", "yes", "on")
+    raw = os.environ.get("TRANSIT_MODELS", "").strip()
+    models = []
+    if raw:
+        for m in raw.split(","):
+            m = m.strip()
+            if m:
+                models.append(m)
+    return enabled, models
+
+
+def _resolve_target_url(default=None):
+    """从 X-Target-URL 请求头读目标 URL。
+
+    v261025-3 关键设计：中转不再维护 UPSTREAMS 表，目标由客户端决定。
+    """
+    target = request.headers.get("X-Target-URL", "").strip()
+    if not target:
+        target = default
+    return target
 
 
 # --- 请求日志 -----------------------------------------------------------
-# 排障关键：每个请求记录 method / path / provider / 上游状态码 / 耗时。
-# Docker 部署看 `docker logs`，systemd 看 journalctl。
 @app.after_request
 def _log_request(resp):
     try:
         dur = getattr(request, "_start_ts", None)
         dur_ms = int((time.time() - dur) * 1000) if dur else -1
         app.logger.info(
-            "%s %s provider=%s -> %d (%dms)",
+            "%s %s target=%s -> %d (%dms)",
             request.method, request.path,
-            request.headers.get("X-Provider", "-") or "-",
+            request.headers.get("X-Target-URL", "-") or "-",
             resp.status_code, dur_ms,
         )
     except Exception:
@@ -105,8 +116,12 @@ def _mark_start():
 
 
 def _forward_headers(upstream_url):
-    """构造转发给上游的请求头。"""
-    # 复制 Authorization / Content-Type / Accept。
+    """构造转发给上游的请求头。
+
+    Authorization / Content-Type / Accept 原样转发。
+    X-Target-URL / X-Provider 等 transit 元数据头**不**转发给上游
+    （它们只是中转自己的控制信号）。
+    """
     out = {
         "Content-Type": request.headers.get("Content-Type", "application/json"),
         "Accept": request.headers.get("Accept", "application/json"),
@@ -114,10 +129,6 @@ def _forward_headers(upstream_url):
     auth = request.headers.get("Authorization")
     if auth:
         out["Authorization"] = auth
-    # 智谱需要的特殊 header
-    if "open.bigmodel.cn" in upstream_url:
-        # 智谱 OpenAI 兼容接口接受 Authorization Bearer
-        pass
     return out
 
 
@@ -137,6 +148,7 @@ def version():
             "POST /v1/tavily/search",
             "POST /v1/images/generations",
             "GET  /v1/fetch_image",
+            "GET  /v1/transit/models",
             "GET  /v1/models",
             "GET  /health",
             "GET  /version",
@@ -144,18 +156,42 @@ def version():
     })
 
 
+@app.route("/v1/transit/models", methods=["GET"])
+@app.route("/v1/models", methods=["GET"])
+def transit_models():
+    """返回中转服务器自带模型列表。
+
+    当 TRANSIT_MODELS_ENABLED=1 时返回 enabled=true + models 数组；
+    否则返回 enabled=false + 空数组，客户端据此提示"此中转服务器不含自带模型"。
+
+    注：这个端点**不**透传到任何上游——它是中转自己的元信息端点。
+    """
+    enabled, models = _transit_models()
+    return jsonify({
+        "enabled": enabled,
+        "models": models,
+        "count": len(models),
+    })
+
+
 @app.route("/v1/chat/completions", methods=["POST"])
 def chat_completions():
     """透传 chat completions 请求，支持 SSE 流式响应。
+
+    v261025-3 改造：
+      - 客户端必须带 X-Target-URL header（例如
+        https://discovery-api.intern-ai.org.cn/v1/chat/completions），
+        中转用它作为真正目标，原样转发 body（含 model / messages /
+        Authorization）。
+      - 不再有 DEFAULT_MODELS / X-Provider 路由逻辑。
 
     iOS 6 客户端用 NSURLConnection 接收流；中转服务器用 requests
     的 stream=True 接收上游 SSE，然后通过 Flask 的
     stream_with_context 生成器把 chunk 原样转发给客户端。
     """
-    provider, upstream_base = _resolve_upstream()
-    # UPSTREAMS 已包含版本路径 (/v1 或 /api/paas/v4)，
-    # 直接拼 /chat/completions 即可。
-    upstream_url = upstream_base.rstrip("/") + "/chat/completions"
+    target_url = _resolve_target_url()
+    if not target_url:
+        return jsonify({"error": "missing X-Target-URL header"}), 400
 
     body = request.get_data(as_text=False)
     try:
@@ -164,29 +200,21 @@ def chat_completions():
         app.logger.warning("invalid JSON body from %s", request.remote_addr)
         return jsonify({"error": "invalid JSON body"}), 400
 
-    app.logger.info("chat provider=%s model=%s stream=%s msgs=%d",
-                    provider,
-                    body_json.get("model", "<server-default>"),
-                    body_json.get("stream", False),
+    is_stream = body_json.get("stream", False)
+    app.logger.info("chat target=%s model=%s stream=%s msgs=%d",
+                    target_url,
+                    body_json.get("model", "<none>"),
+                    is_stream,
                     len(body_json.get("messages", [])))
 
-    # 如果客户端没传 model 字段（"使用中转服务器的模型"开关开启），
-    # 用中转服务器的默认模型填上。
-    if not body_json.get("model") and provider in DEFAULT_MODELS:
-        body_json["model"] = DEFAULT_MODELS[provider]
-        body = json.dumps(body_json).encode("utf-8")
-        app.logger.info(f"substituted default model {body_json['model']} for provider {provider}")
-
-    # 强制 stream=true 透传（如果客户端请求流式）
-    is_stream = body_json.get("stream", False)
-    headers = _forward_headers(upstream_url)
+    headers = _forward_headers(target_url)
     # 上游期望 Accept: text/event-stream 才能正常流式返回
     if is_stream:
         headers["Accept"] = "text/event-stream"
 
     try:
         upstream_resp = requests.post(
-            upstream_url,
+            target_url,
             data=body,
             headers=headers,
             stream=is_stream,
@@ -228,27 +256,25 @@ def chat_completions():
 
 @app.route("/v1/tavily/search", methods=["POST"])
 def tavily_search():
-    """透传到 Tavily API。
+    """透传到 Tavily API（或客户端指定的 X-Target-URL）。
 
-    客户端在请求体里放：
-      {"api_key": "...", "query": "...", "max_results": N}
-    我们原样转发到 https://api.tavily.com/search。
+    默认 target = https://api.tavily.com/search；客户端可用
+    X-Target-URL header 覆盖（极少用到，但保留灵活性）。
     """
-    upstream_url = "https://api.tavily.com/search"
+    target_url = _resolve_target_url(default="https://api.tavily.com/search")
     body = request.get_data(as_text=False)
     headers = {
         "Content-Type": "application/json",
         "Accept": "application/json",
     }
-    # Tavily 接受 api_key 在 body 里，不需要 Authorization header。
-    # 但也兼容 Authorization: Bearer
+    # Tavily 接受 api_key 在 body 里；Authorization Bearer 也兼容
     auth = request.headers.get("Authorization")
     if auth:
         headers["Authorization"] = auth
 
     try:
         upstream_resp = requests.post(
-            upstream_url,
+            target_url,
             data=body,
             headers=headers,
             timeout=(UPSTREAM_CONNECT_TIMEOUT, 30),
@@ -263,50 +289,24 @@ def tavily_search():
     )
 
 
-@app.route("/v1/models", methods=["GET"])
-def list_models():
-    """透传 GET /v1/models。"""
-    provider, upstream_base = _resolve_upstream()
-    upstream_url = upstream_base.rstrip("/") + "/models"
-    headers = _forward_headers(upstream_url)
-    # GET 请求没有 body
-    try:
-        upstream_resp = requests.get(
-            upstream_url,
-            headers=headers,
-            timeout=(UPSTREAM_CONNECT_TIMEOUT, 15),
-        )
-    except requests.RequestException as e:
-        return jsonify({"error": "upstream error", "detail": str(e)}), 502
-
-    return Response(
-        upstream_resp.content,
-        status=upstream_resp.status_code,
-        content_type=upstream_resp.headers.get("Content-Type", "application/json"),
-    )
-
-
 @app.route("/v1/images/generations", methods=["POST"])
 def images_generations():
-    """透传到上游图片生成 API.
+    """透传到上游图片生成 API。
 
-    客户端在请求体里放:
-      {"model": "dall-e-3" | "cogview-3plus" | ...,
-       "prompt": "...", "n": 1, "size": "1024x1024",
-       "response_format": "b64_json" | "url"}
-
-    路由:
-      X-Provider: openai → https://api.openai.com/v1/images/generations
-      X-Provider: zhipu  → https://open.bigmodel.cn/api/paas/v4/images/generations
+    客户端必须带 X-Target-URL header（例如
+    https://api.openai.com/v1/images/generations 或
+    https://open.bigmodel.cn/api/paas/v4/images/generations），
+    中转原样转发 body。
     """
-    provider, upstream_base = _resolve_upstream()
-    upstream_url = upstream_base.rstrip("/") + "/images/generations"
+    target_url = _resolve_target_url()
+    if not target_url:
+        return jsonify({"error": "missing X-Target-URL header"}), 400
     body = request.get_data(as_text=False)
-    headers = _forward_headers(upstream_url)
+    headers = _forward_headers(target_url)
 
     try:
         upstream_resp = requests.post(
-            upstream_url,
+            target_url,
             data=body,
             headers=headers,
             timeout=(UPSTREAM_CONNECT_TIMEOUT, 120),  # image gen can be slow
@@ -325,11 +325,7 @@ def images_generations():
 def fetch_image():
     """通过中转服务器拉取任意图片 URL，返回原始字节.
 
-    用来规避 iOS 6 NSURLConnection 无法与某些图片托管服务（如 Azure
-    Blob Storage、AWS S3）协商 TLS 的问题。
-
     用法: GET /v1/fetch_image?url=https://example.com/image.png
-    返回: 原始图片字节，Content-Type 由上游决定。
     """
     image_url = request.args.get("url")
     if not image_url:
@@ -350,17 +346,22 @@ def fetch_image():
 
 @app.route("/", methods=["GET"])
 def index():
+    enabled, models = _transit_models()
     return jsonify({
         "service": "online-ai-transit-server",
+        "version": SERVER_VERSION,
         "endpoints": [
             "POST /v1/chat/completions",
             "POST /v1/tavily/search",
             "POST /v1/images/generations",
             "GET  /v1/fetch_image",
+            "GET  /v1/transit/models",
             "GET  /v1/models",
             "GET  /health",
+            "GET  /version",
         ],
-        "providers": list(UPSTREAMS.keys()),
+        "transit_models_enabled": enabled,
+        "transit_models": models,
     })
 
 
